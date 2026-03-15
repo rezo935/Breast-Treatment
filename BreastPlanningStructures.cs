@@ -9,7 +9,7 @@ Goal: Create and modify structures for breast IMRT/VMAT planning using high-reso
 
 using System;
 using System.Collections.Generic;
-using System.Drawing;
+using System.Windows.Media;
 using System.Linq;
 using System.Windows.Media.Media3D;
 using VMS.TPS.Common.Model.API;
@@ -77,7 +77,7 @@ public class BreastPlanningStructures
     private Structure CreateActualBody(StructureSet structureSet, Image image)
     {
         Structure actualBody = structureSet.AddStructure("CONTROL", "Actual Body");
-        actualBody.Color = Color.Magenta;
+        actualBody.Color = Colors.Magenta;
         actualBody.ConvertToHighResolution();
         GenerateStructureFromHUThreshold(actualBody, image, lowerHU: -300.0);
         return actualBody;
@@ -129,7 +129,7 @@ public class BreastPlanningStructures
             supInfMargin, supInfMargin);     // –Z / +Z
 
         Structure breathingMargin = structureSet.AddStructure("PTV", "Breathing Margin");
-        breathingMargin.Color = Color.Orange;
+        breathingMargin.Color = Colors.Orange;
         breathingMargin.ConvertToHighResolution();
         breathingMargin.SegmentVolume = ctvBreast.SegmentVolume.AsymmetricMargin(margins);
         return breathingMargin;
@@ -157,7 +157,7 @@ public class BreastPlanningStructures
         SegmentVolume cropVolume = breathingMargin.SegmentVolume.And(contractedBody);
 
         Structure breathingMarginCrop = structureSet.AddStructure("PTV", "Breathing Margin Crop");
-        breathingMarginCrop.Color = Color.Orange;
+        breathingMarginCrop.Color = Colors.Orange;
         breathingMarginCrop.ConvertToHighResolution();
         breathingMarginCrop.SegmentVolume = cropVolume;
     }
@@ -350,22 +350,22 @@ public class BreastPlanningStructures
     /// </summary>
     private static VVector PixelToPatient(Image image, int x, int y, int z)
     {
-        // Patient position = Origin + x·XRes·RowDirection
-        //                           + y·YRes·ColumnDirection
-        //                           + z·ZRes·NormalDirection
+        // Patient position = Origin + x·XRes·XDirection
+        //                           + y·YRes·YDirection
+        //                           + z·ZRes·ZDirection
         return new VVector(
             image.Origin.x
-                + x * image.XRes * image.RowDirection.x
-                + y * image.YRes * image.ColumnDirection.x
-                + z * image.ZRes * image.NormalDirection.x,
+                + x * image.XRes * image.XDirection.x
+                + y * image.YRes * image.YDirection.x
+                + z * image.ZRes * image.ZDirection.x,
             image.Origin.y
-                + x * image.XRes * image.RowDirection.y
-                + y * image.YRes * image.ColumnDirection.y
-                + z * image.ZRes * image.NormalDirection.y,
+                + x * image.XRes * image.XDirection.y
+                + y * image.YRes * image.YDirection.y
+                + z * image.ZRes * image.ZDirection.y,
             image.Origin.z
-                + x * image.XRes * image.RowDirection.z
-                + y * image.YRes * image.ColumnDirection.z
-                + z * image.ZRes * image.NormalDirection.z);
+                + x * image.XRes * image.XDirection.z
+                + y * image.YRes * image.YDirection.z
+                + z * image.ZRes * image.ZDirection.z);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
