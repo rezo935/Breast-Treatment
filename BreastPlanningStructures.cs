@@ -554,6 +554,6 @@ public class BreastPlanningStructures
         return structureSet.Structures
             .FirstOrDefault(s => s.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException(
-                $"Required structure '{id}' not found in the structure set.");
+                string.Format("Required structure '{0}' not found in the structure set.", id));
     }
 }
