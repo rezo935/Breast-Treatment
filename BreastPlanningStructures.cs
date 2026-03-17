@@ -35,8 +35,9 @@ public class BreastPlanningStructures
 
         // "CTV Breast" is mandatory; abort with a clear message if it is absent.
         Structure ctvBreast = structureSet.Structures
-            .FirstOrDefault(s => s.Id.Equals("CTV Breast", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
+            .FirstOrDefault(s => s.Id.Equals("CTV Breast", StringComparison.OrdinalIgnoreCase));
+        if (ctvBreast == null)
+            throw new InvalidOperationException(
                 "Structure 'CTV Breast' not found in the structure set.");
 
         // Laterality is determined from the structure ID (not geometry) so that
@@ -551,9 +552,11 @@ public class BreastPlanningStructures
     /// </summary>
     private static Structure GetRequiredStructure(StructureSet structureSet, string id)
     {
-        return structureSet.Structures
-            .FirstOrDefault(s => s.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
+        Structure structure = structureSet.Structures
+            .FirstOrDefault(s => s.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        if (structure == null)
+            throw new InvalidOperationException(
                 string.Format("Required structure '{0}' not found in the structure set.", id));
+        return structure;
     }
 }
