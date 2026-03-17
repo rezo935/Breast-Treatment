@@ -1,15 +1,15 @@
 /*
 ========================================================================================
-ESAPI C# SCRIPT: Breast Planning - Structure Preparation Workflow
+ESAPI C# SCRIPT: Smart, Modular Breast Structure Preparation
 Context: Varian Eclipse TPS.
-Inputs needed: StructureSet, Image.
-Goal: Create and modify structures for breast IMRT/VMAT planning using high-resolution segments.
+Goal: Automatically detect laterality and the presence of optional targets (Boost, LN, IMN)
+to dynamically execute only the necessary structure creation steps.
 ========================================================================================
 */
 
 using System;
 using System.Collections.Generic;
-using System.Drawing;
+using System.Windows.Media;
 using System.Linq;
 using System.Windows.Media.Media3D;
 using VMS.TPS.Common.Model.API;
@@ -23,30 +23,92 @@ using VMS.TPS.Common.Model.Types;
 public class BreastPlanningStructures
 {
     /// <summary>
-    /// Creates all breast planning structures sequentially (Steps 1–5).
+    /// Smart, modular entry point.  Detects laterality and the presence of
+    /// optional targets (Boost, LN, IMN) and then executes only the steps
+    /// that are required for the current patient.
     /// </summary>
     /// <param name="structureSet">The active structure set to modify.</param>
     /// <param name="image">The CT image used for HU-based thresholding.</param>
     public void CreateBreastStructures(StructureSet structureSet, Image image)
     {
-        // STEP 1: Standard Body
+        // ── STEP 1: Automatic Detection & Setup ──────────────────────────────
+
+        // "CTV Breast" is mandatory; abort with a clear message if it is absent.
+        Structure ctvBreast = structureSet.Structures
+            .FirstOrDefault(s => s.Id.Equals("CTV Breast", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException(
+                "Structure 'CTV Breast' not found in the structure set.");
+
+        // Laterality is determined from the structure ID (not geometry) so that
+        // the user's naming convention ("Left", "L ", "L_") is respected exactly.
+        bool isLeft = DetectLaterality(ctvBreast.Id);
+
+        // Optional-module flags drive which later steps are executed.
+        bool hasBoost = StructureExists(structureSet, "PTV Boost");
+        bool hasLN    = StructureExists(structureSet, "CTV LN") ||
+                        StructureExists(structureSet, "PTV LN");
+        bool hasIMN   = StructureExists(structureSet, "CTV IMN") ||
+                        StructureExists(structureSet, "PTV IMN");
+
+        // Pre-fetch lung structures once; both are required for all crop operations.
+        Structure lungL = GetRequiredStructure(structureSet, "Lung L");
+        Structure lungR = GetRequiredStructure(structureSet, "Lung R");
+
+        // ── STEP 2: Base Structures (always executed) ─────────────────────────
+
         CreateStandardBody(structureSet, image);
 
-        // STEP 2: Actual Body
         Structure actualBody = CreateActualBody(structureSet, image);
 
-        // STEP 3: Breathing Margin
-        Structure breathingMargin = CreateBreathingMargin(structureSet);
+        Structure breathingMargin = CreateBreathingMargin(structureSet, ctvBreast, isLeft);
 
-        // STEP 4: Breathing Margin Crop
-        CreateBreathingMarginCrop(structureSet, actualBody, breathingMargin);
+        Structure breathingMarginCrop = CreateBreathingMarginCrop(structureSet, actualBody, breathingMargin);
 
-        // STEP 5: Optimization structures
-        CreateOptimizationStructures(structureSet, actualBody);
+        CreateCtvBreastOpt(structureSet, ctvBreast, actualBody, lungL, lungR);
+
+        // ── STEP 3: Nodal Structures (only when nodal targets are present) ────
+
+        Structure ptvLnOpt  = null;
+        Structure ptvImnOpt = null;
+
+        if (hasLN || hasIMN)
+            CreateNodalStructures(structureSet, actualBody, lungL, lungR,
+                hasLN, hasIMN, out ptvLnOpt, out ptvImnOpt);
+
+        // ── STEP 4: SIB Logic (only when a boost target is present) ───────────
+
+        if (hasBoost)
+            CreateSibStructures(structureSet, breathingMarginCrop, ptvLnOpt, ptvImnOpt);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STEP 1 – Standard Body
+    // STEP 1 Helpers – Detection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns <see langword="true"/> when <paramref name="structureId"/> indicates
+    /// a left-sided breast target.  Matches "Left" (case-insensitive), "L " or "L_".
+    /// If none of the left-side tokens are found, right side is assumed.
+    /// </summary>
+    private static bool DetectLaterality(string structureId)
+    {
+        return structureId.IndexOf("Left", StringComparison.OrdinalIgnoreCase) >= 0
+            || structureId.IndexOf("L ", StringComparison.OrdinalIgnoreCase) >= 0
+            || structureId.IndexOf("L_", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when a structure with <paramref name="id"/>
+    /// (case-insensitive) is present in <paramref name="structureSet"/>.
+    /// </summary>
+    private static bool StructureExists(StructureSet structureSet, string id)
+    {
+        return structureSet.Structures
+            .Any(s => s.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 2 – Standard Body
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -77,31 +139,32 @@ public class BreastPlanningStructures
     private Structure CreateActualBody(StructureSet structureSet, Image image)
     {
         Structure actualBody = structureSet.AddStructure("CONTROL", "Actual Body");
-        actualBody.Color = Color.Magenta;
+        actualBody.Color = Colors.Magenta;
         actualBody.ConvertToHighResolution();
         GenerateStructureFromHUThreshold(actualBody, image, lowerHU: -300.0);
         return actualBody;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STEP 3 – Breathing Margin
+    // STEP 2 – Breathing Margin
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
     /// Creates the "Breathing Margin" PTV structure by applying an asymmetric
-    /// outer margin to "CTV Breast". The lateral/medial margin sides are
-    /// determined by the laterality of "CTV Breast".
+    /// outer margin to <paramref name="ctvBreast"/>.  Laterality is supplied via
+    /// <paramref name="isLeft"/> (detected from the structure ID in STEP 1).
+    /// <list type="bullet">
+    ///   <item>Left breast : Left 1.0 cm / Right 0.4 cm</item>
+    ///   <item>Right breast: Left 0.4 cm / Right 1.0 cm</item>
+    ///   <item>Anterior 2.0 cm, Posterior 0.5 cm, Superior/Inferior 0.8 cm (both sides)</item>
+    /// </list>
     /// Colour: Orange.
     /// </summary>
-    private Structure CreateBreathingMargin(StructureSet structureSet)
+    private static Structure CreateBreathingMargin(
+        StructureSet structureSet,
+        Structure ctvBreast,
+        bool isLeft)
     {
-        Structure ctvBreast = structureSet.Structures
-            .FirstOrDefault(s => s.Id.Equals("CTV Breast", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
-                "Structure 'CTV Breast' not found in the structure set.");
-
-        bool isLeftSided = IsLeftSided(ctvBreast);
-
         // All margins expressed in millimetres (ESAPI uses mm internally).
         //   2.0 cm = 20 mm  |  0.5 cm =  5 mm  |  0.8 cm = 8 mm
         //   1.0 cm = 10 mm  |  0.4 cm =  4 mm
@@ -119,8 +182,8 @@ public class BreastPlanningStructures
         // AxisAlignedMargins(geometry, x1(–X/Right), x2(+X/Left),
         //                              y1(–Y/Ant),   y2(+Y/Post),
         //                              z1(–Z/Inf),   z2(+Z/Sup))
-        double rightMargin = isLeftSided ? medialMargin  : lateralMargin;
-        double leftMargin  = isLeftSided ? lateralMargin : medialMargin;
+        double rightMargin = isLeft ? medialMargin  : lateralMargin;
+        double leftMargin  = isLeft ? lateralMargin : medialMargin;
 
         var margins = new AxisAlignedMargins(
             StructureMarginGeometry.Outer,
@@ -129,22 +192,23 @@ public class BreastPlanningStructures
             supInfMargin, supInfMargin);     // –Z / +Z
 
         Structure breathingMargin = structureSet.AddStructure("PTV", "Breathing Margin");
-        breathingMargin.Color = Color.Orange;
+        breathingMargin.Color = Colors.Orange;
         breathingMargin.ConvertToHighResolution();
         breathingMargin.SegmentVolume = ctvBreast.SegmentVolume.AsymmetricMargin(margins);
         return breathingMargin;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STEP 4 – Breathing Margin Crop
+    // STEP 2 – Breathing Margin Crop
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Creates "Breathing Margin Crop" as the intersection of "Breathing Margin"
-    /// with "Actual Body" contracted by 4 mm (0.4 cm inner margin).
+    /// Creates "Breathing Margin Crop" as the intersection of
+    /// <paramref name="breathingMargin"/> with "Actual Body" contracted by 4 mm
+    /// (0.4 cm inner margin).
     /// Colour: Orange.
     /// </summary>
-    private void CreateBreathingMarginCrop(
+    private static Structure CreateBreathingMarginCrop(
         StructureSet structureSet,
         Structure actualBody,
         Structure breathingMargin)
@@ -157,49 +221,92 @@ public class BreastPlanningStructures
         SegmentVolume cropVolume = breathingMargin.SegmentVolume.And(contractedBody);
 
         Structure breathingMarginCrop = structureSet.AddStructure("PTV", "Breathing Margin Crop");
-        breathingMarginCrop.Color = Color.Orange;
+        breathingMarginCrop.Color = Colors.Orange;
         breathingMarginCrop.ConvertToHighResolution();
         breathingMarginCrop.SegmentVolume = cropVolume;
+        return breathingMarginCrop;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // STEP 5 – Optimization Structures
+    // STEP 2 – CTV Breast Opt
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Duplicates CTV/PTV structures into "Opt" variants, then:
-    ///  • CTV Opt: crops 4 mm inside Actual Body and subtracts both lungs.
-    ///  • PTV Opt: crops 3 mm inside Actual Body and subtracts both lungs.
-    /// Source structures that do not exist in the structure set are skipped.
+    /// Creates "CTV Breast Opt" by cropping <paramref name="ctvBreast"/> 4 mm
+    /// inside <paramref name="actualBody"/> and subtracting both lung structures.
     /// </summary>
-    private void CreateOptimizationStructures(StructureSet structureSet, Structure actualBody)
+    private static void CreateCtvBreastOpt(
+        StructureSet structureSet,
+        Structure ctvBreast,
+        Structure actualBody,
+        Structure lungL,
+        Structure lungR)
     {
-        Structure lungL = GetRequiredStructure(structureSet, "Lung L");
-        Structure lungR = GetRequiredStructure(structureSet, "Lung R");
+        SegmentVolume vol = ctvBreast.SegmentVolume
+            .And(actualBody.SegmentVolume.Margin(-4.0))
+            .Sub(lungL.SegmentVolume)
+            .Sub(lungR.SegmentVolume);
 
-        // CTV Opt structures – crop 4 mm inside Actual Body
-        DuplicateAndCropOpt(structureSet, "CTV Breast", "CTV Breast Opt",
-            actualBody, lungL, lungR, cropMm: 4.0, dicomType: "CTV");
+        Structure opt = structureSet.AddStructure("CTV", "CTV Breast Opt");
+        opt.ConvertToHighResolution();
+        opt.SegmentVolume = vol;
+    }
 
-        DuplicateAndCropOpt(structureSet, "CTV LN", "CTV LN Opt",
-            actualBody, lungL, lungR, cropMm: 4.0, dicomType: "CTV");
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 3 – Nodal Structures
+    // ─────────────────────────────────────────────────────────────────────────
 
-        DuplicateAndCropOpt(structureSet, "CTV IMN", "CTV IMN Opt",
-            actualBody, lungL, lungR, cropMm: 4.0, dicomType: "CTV");
+    /// <summary>
+    /// Creates optimisation variants of nodal CTV/PTV structures.
+    /// <list type="bullet">
+    ///   <item>CTV Opt: cropped 4 mm inside Actual Body, lungs subtracted.</item>
+    ///   <item>PTV Opt: cropped 3 mm inside Actual Body, lungs subtracted.</item>
+    /// </list>
+    /// Source structures that are absent in the structure set are skipped silently.
+    /// The created "PTV LN Opt" and "PTV IMN Opt" structures are returned via
+    /// <paramref name="ptvLnOpt"/> and <paramref name="ptvImnOpt"/> so that STEP 4
+    /// can incorporate them into PTV Total.
+    /// </summary>
+    private static void CreateNodalStructures(
+        StructureSet structureSet,
+        Structure actualBody,
+        Structure lungL,
+        Structure lungR,
+        bool hasLN,
+        bool hasIMN,
+        out Structure ptvLnOpt,
+        out Structure ptvImnOpt)
+    {
+        ptvLnOpt  = null;
+        ptvImnOpt = null;
 
-        // PTV Opt structures – crop 3 mm inside Actual Body
-        DuplicateAndCropOpt(structureSet, "PTV LN", "PTV LN Opt",
-            actualBody, lungL, lungR, cropMm: 3.0, dicomType: "PTV");
+        if (hasLN)
+        {
+            DuplicateAndCropOpt(structureSet, "CTV LN", "CTV LN Opt",
+                actualBody, lungL, lungR, cropMm: 4.0, dicomType: "CTV");
 
-        DuplicateAndCropOpt(structureSet, "PTV IMN", "PTV IMN Opt",
-            actualBody, lungL, lungR, cropMm: 3.0, dicomType: "PTV");
+            ptvLnOpt = DuplicateAndCropOpt(structureSet, "PTV LN", "PTV LN Opt",
+                actualBody, lungL, lungR, cropMm: 3.0, dicomType: "PTV");
+        }
+
+        if (hasIMN)
+        {
+            DuplicateAndCropOpt(structureSet, "CTV IMN", "CTV IMN Opt",
+                actualBody, lungL, lungR, cropMm: 4.0, dicomType: "CTV");
+
+            ptvImnOpt = DuplicateAndCropOpt(structureSet, "PTV IMN", "PTV IMN Opt",
+                actualBody, lungL, lungR, cropMm: 3.0, dicomType: "PTV");
+        }
     }
 
     /// <summary>
-    /// Creates a new "Opt" structure by duplicating <paramref name="sourceId"/>,
-    /// cropping it to the contracted body, and subtracting both lung structures.
+    /// Creates a new optimisation structure from <paramref name="sourceId"/> by
+    /// intersecting it with <paramref name="actualBody"/> contracted inward by
+    /// <paramref name="cropMm"/> millimetres, then subtracting both lungs.
+    /// Returns the created <see cref="Structure"/>, or <see langword="null"/> when
+    /// the source structure is not present in the structure set.
     /// </summary>
-    private void DuplicateAndCropOpt(
+    private static Structure DuplicateAndCropOpt(
         StructureSet structureSet,
         string sourceId,
         string targetId,
@@ -213,7 +320,7 @@ public class BreastPlanningStructures
             .FirstOrDefault(s => s.Id.Equals(sourceId, StringComparison.OrdinalIgnoreCase));
 
         if (source == null)
-            return; // Source structure absent – skip silently
+            return null; // Source structure absent – skip silently
 
         // Contract Actual Body inward by cropMm to define the crop boundary
         SegmentVolume croppedBody = actualBody.SegmentVolume.Margin(-cropMm);
@@ -227,6 +334,72 @@ public class BreastPlanningStructures
         Structure target = structureSet.AddStructure(dicomType, targetId);
         target.ConvertToHighResolution();
         target.SegmentVolume = vol;
+        return target;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 4 – SIB Structures
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates the three SIB (Simultaneous Integrated Boost) planning structures:
+    /// <list type="bullet">
+    ///   <item>
+    ///     <term>PTV Total</term>
+    ///     <description>
+    ///       Union of "Breathing Margin Crop" with any existing nodal PTV Opt
+    ///       structures ("PTV LN Opt", "PTV IMN Opt").
+    ///     </description>
+    ///   </item>
+    ///   <item>
+    ///     <term>PTV Elective</term>
+    ///     <description>
+    ///       "PTV Total" minus a 1.0 cm outer expansion of "PTV Boost".
+    ///     </description>
+    ///   </item>
+    ///   <item>
+    ///     <term>PTV TR</term>
+    ///     <description>
+    ///       "PTV Total" minus "PTV Boost" minus "PTV Elective".
+    ///     </description>
+    ///   </item>
+    /// </list>
+    /// </summary>
+    private static void CreateSibStructures(
+        StructureSet structureSet,
+        Structure breathingMarginCrop,
+        Structure ptvLnOpt,
+        Structure ptvImnOpt)
+    {
+        Structure ptvBoost = GetRequiredStructure(structureSet, "PTV Boost");
+
+        // PTV Total = Breathing Margin Crop ∪ PTV LN Opt (opt.) ∪ PTV IMN Opt (opt.)
+        SegmentVolume ptvTotalVol = breathingMarginCrop.SegmentVolume;
+        if (ptvLnOpt != null)
+            ptvTotalVol = ptvTotalVol.Or(ptvLnOpt.SegmentVolume);
+        if (ptvImnOpt != null)
+            ptvTotalVol = ptvTotalVol.Or(ptvImnOpt.SegmentVolume);
+
+        Structure ptvTotal = structureSet.AddStructure("PTV", "PTV Total");
+        ptvTotal.ConvertToHighResolution();
+        ptvTotal.SegmentVolume = ptvTotalVol;
+
+        // PTV Elective = PTV Total − (PTV Boost expanded 1.0 cm outward)
+        SegmentVolume boostExpanded = ptvBoost.SegmentVolume.Margin(10.0); // 10 mm = 1.0 cm
+        SegmentVolume ptvElectiveVol = ptvTotalVol.Sub(boostExpanded);
+
+        Structure ptvElective = structureSet.AddStructure("PTV", "PTV Elective");
+        ptvElective.ConvertToHighResolution();
+        ptvElective.SegmentVolume = ptvElectiveVol;
+
+        // PTV TR = PTV Total − PTV Boost − PTV Elective
+        SegmentVolume ptvTrVol = ptvTotalVol
+            .Sub(ptvBoost.SegmentVolume)
+            .Sub(ptvElectiveVol);
+
+        Structure ptvTr = structureSet.AddStructure("PTV", "PTV TR");
+        ptvTr.ConvertToHighResolution();
+        ptvTr.SegmentVolume = ptvTrVol;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -350,40 +523,27 @@ public class BreastPlanningStructures
     /// </summary>
     private static VVector PixelToPatient(Image image, int x, int y, int z)
     {
-        // Patient position = Origin + x·XRes·RowDirection
-        //                           + y·YRes·ColumnDirection
-        //                           + z·ZRes·NormalDirection
+        // Patient position = Origin + x·XRes·XDirection
+        //                           + y·YRes·YDirection
+        //                           + z·ZRes·ZDirection
         return new VVector(
             image.Origin.x
-                + x * image.XRes * image.RowDirection.x
-                + y * image.YRes * image.ColumnDirection.x
-                + z * image.ZRes * image.NormalDirection.x,
+                + x * image.XRes * image.XDirection.x
+                + y * image.YRes * image.YDirection.x
+                + z * image.ZRes * image.ZDirection.x,
             image.Origin.y
-                + x * image.XRes * image.RowDirection.y
-                + y * image.YRes * image.ColumnDirection.y
-                + z * image.ZRes * image.NormalDirection.y,
+                + x * image.XRes * image.XDirection.y
+                + y * image.YRes * image.YDirection.y
+                + z * image.ZRes * image.ZDirection.y,
             image.Origin.z
-                + x * image.XRes * image.RowDirection.z
-                + y * image.YRes * image.ColumnDirection.z
-                + z * image.ZRes * image.NormalDirection.z);
+                + x * image.XRes * image.XDirection.z
+                + y * image.YRes * image.YDirection.z
+                + z * image.ZRes * image.ZDirection.z);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Utility Helpers
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Returns <see langword="true"/> when the centroid of
-    /// <paramref name="structure"/>'s bounding box lies in the positive-X half of
-    /// patient space, which corresponds to the patient's LEFT side in standard
-    /// Head-First Supine (HFS) orientation.
-    /// </summary>
-    private static bool IsLeftSided(Structure structure)
-    {
-        Rect3D bounds = structure.MeshGeometry.Bounds;
-        double centerX = bounds.X + bounds.SizeX / 2.0;
-        return centerX > 0.0;
-    }
 
     /// <summary>
     /// Finds a structure by ID (case-insensitive) and throws a descriptive
@@ -394,6 +554,6 @@ public class BreastPlanningStructures
         return structureSet.Structures
             .FirstOrDefault(s => s.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException(
-                $"Required structure '{id}' not found in the structure set.");
+                string.Format("Required structure '{0}' not found in the structure set.", id));
     }
 }
