@@ -4,7 +4,7 @@ ESAPI base automation for breast treatments
 ## BreastLRv3 flexible beam-angle generation
 
 A new single-file script is available at:
-`/home/runner/work/Breast-Treatment/Breast-Treatment/BreastLRv3/BreastLRv3.cs`
+`BreastLRv3/BreastLRv3.cs`
 
 ### What it does
 - WPF dialog captures:

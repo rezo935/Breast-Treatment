@@ -15,7 +15,10 @@ namespace VMS.TPS
 {
     public class Script
     {
-        public void Execute(ScriptContext context /*, Window window, ScriptEnvironment environment*/)
+        private const int MaxBeamIdLength = 16;
+        private const int PreferredBeamIdBaseLength = 12;
+
+        public void Execute(ScriptContext context)
         {
             if (context == null || context.Patient == null || context.Course == null || context.ExternalPlanSetup == null)
             {
@@ -138,14 +141,14 @@ namespace VMS.TPS
             if (string.IsNullOrWhiteSpace(root))
                 root = "BRT" + index.ToString("00", CultureInfo.InvariantCulture);
 
-            root = root.Length > 12 ? root.Substring(0, 12) : root;
+            root = root.Length > PreferredBeamIdBaseLength ? root.Substring(0, PreferredBeamIdBaseLength) : root;
             string candidate = root;
             int suffix = 1;
 
             while (plan.Beams.Any(b => string.Equals(b.Id, candidate, StringComparison.OrdinalIgnoreCase)))
             {
                 string suffixText = suffix.ToString(CultureInfo.InvariantCulture);
-                int maxBase = Math.Max(1, 16 - suffixText.Length);
+                int maxBase = Math.Max(1, MaxBeamIdLength - suffixText.Length);
                 string trimmedRoot = root.Length > maxBase ? root.Substring(0, maxBase) : root;
                 candidate = trimmedRoot + suffixText;
                 suffix++;
@@ -225,6 +228,9 @@ namespace VMS.TPS
 
     internal static class BreastBeamAngleCalculator
     {
+        // Small tolerance to safely treat parsed values extremely close to 360° as 360°.
+        private const double AngleTolerance = 0.000000001;
+
         // Offsets are in degrees relative to user-entered Medial0 gantry.
         // Left breast applies offsets directly. Right breast mirrors offsets.
         private static readonly double[] OffsetsBreastOnly = new[]
@@ -334,7 +340,7 @@ namespace VMS.TPS
             if (parsed < 0.0 || parsed > 360.0)
                 return false;
 
-            angle = parsed == 360.0 ? 0.0 : parsed;
+            angle = Math.Abs(parsed - 360.0) < AngleTolerance ? 360.0 : parsed;
             return true;
         }
 
