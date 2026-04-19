@@ -47,13 +47,16 @@ namespace VMS.TPS
             log.AppendLine("BreastLRv3 angle generation");
             log.AppendLine("---------------------------");
             log.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "Inputs: Medial0={0:0.##}°, Collimator={1:0.##}°, Couch={2:0.##}°, Laterality={3}, LN/IMN={4}, RemainingOnly={5}",
+                "Inputs: Medial0={0:0.##}°, Collimator={1:0.##}°, Couch={2:0.##}°, Laterality={3}, LN/IMN={4}, RemainingOnly={5}, Machine={6}, Energy={7}, DoseRate={8}",
                 request.Medial0Gantry,
                 request.Collimator,
                 request.Couch,
                 request.Laterality == BreastLaterality.Left ? "Left" : "Right",
                 request.IncludeLnImn ? "Yes" : "No",
-                request.Medial0AlreadyExists ? "Yes" : "No"));
+                request.Medial0AlreadyExists ? "Yes" : "No",
+                request.MachineId,
+                request.EnergyModeDisplayName,
+                request.DoseRate));
 
             try
             {
@@ -89,9 +92,9 @@ namespace VMS.TPS
             var jaw = cp.JawPositions;
             var iso = templateBeam.IsocenterPosition;
             var machine = new ExternalBeamMachineParameters(
-                templateBeam.TreatmentUnit.Id,
-                templateBeam.EnergyModeDisplayName,
-                templateBeam.DoseRate,
+                input.MachineId,
+                input.EnergyModeDisplayName,
+                input.DoseRate,
                 "STATIC",
                 null);
 
@@ -159,6 +162,7 @@ namespace VMS.TPS
 
         private static BeamAngleInput BuildDefaults(ScriptContext context, ExternalPlanSetup plan)
         {
+            var machineEnergies = DiscoverMachineEnergyOptions(context, plan);
             var input = new BeamAngleInput();
             input.Collimator = 0.0;
             input.Couch = 0.0;
@@ -166,6 +170,7 @@ namespace VMS.TPS
             input.Laterality = GuessLaterality(context);
             input.IncludeLnImn = false;
             input.Medial0AlreadyExists = false;
+            input.AvailableMachineEnergies = machineEnergies;
 
             var beam = plan.Beams.FirstOrDefault(b => !b.IsSetupField);
             if (beam != null)
@@ -173,9 +178,70 @@ namespace VMS.TPS
                 input.Medial0Gantry = NormalizeAngle(beam.GantryAngle);
                 input.Collimator = NormalizeAngle(beam.CollimatorAngle);
                 input.Couch = NormalizeAngle(beam.PatientSupportAngle);
+                input.MachineId = beam.TreatmentUnit != null ? beam.TreatmentUnit.Id : null;
+                input.EnergyModeDisplayName = beam.EnergyModeDisplayName;
+                input.DoseRate = beam.DoseRate;
+            }
+
+            if (string.IsNullOrWhiteSpace(input.MachineId) && machineEnergies.Count > 0)
+            {
+                input.MachineId = machineEnergies[0].MachineId;
+                input.EnergyModeDisplayName = machineEnergies[0].EnergyModeDisplayName;
+                input.DoseRate = machineEnergies[0].DoseRate;
             }
 
             return input;
+        }
+
+        private static List<MachineEnergyOption> DiscoverMachineEnergyOptions(ScriptContext context, ExternalPlanSetup plan)
+        {
+            var discovered = new Dictionary<string, MachineEnergyOption>(StringComparer.OrdinalIgnoreCase);
+
+            Action<Beam> collect = beam =>
+            {
+                if (beam == null || beam.IsSetupField || beam.TreatmentUnit == null)
+                    return;
+
+                string machineId = beam.TreatmentUnit.Id;
+                string energy = beam.EnergyModeDisplayName;
+                if (string.IsNullOrWhiteSpace(machineId) || string.IsNullOrWhiteSpace(energy))
+                    return;
+
+                string key = machineId + "||" + energy + "||" + beam.DoseRate.ToString(CultureInfo.InvariantCulture);
+                if (discovered.ContainsKey(key))
+                    return;
+
+                discovered.Add(key, new MachineEnergyOption
+                {
+                    MachineId = machineId,
+                    EnergyModeDisplayName = energy,
+                    DoseRate = beam.DoseRate
+                });
+            };
+
+            if (context != null && context.Course != null)
+            {
+                foreach (var coursePlan in context.Course.ExternalPlanSetups)
+                {
+                    if (coursePlan == null)
+                        continue;
+
+                    foreach (var beam in coursePlan.Beams)
+                        collect(beam);
+                }
+            }
+
+            if (plan != null)
+            {
+                foreach (var beam in plan.Beams)
+                    collect(beam);
+            }
+
+            return discovered.Values
+                .OrderBy(v => v.MachineId, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(v => v.EnergyModeDisplayName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(v => v.DoseRate)
+                .ToList();
         }
 
         private static BreastLaterality GuessLaterality(ScriptContext context)
@@ -215,6 +281,17 @@ namespace VMS.TPS
         public BreastLaterality Laterality { get; set; }
         public bool IncludeLnImn { get; set; }
         public bool Medial0AlreadyExists { get; set; }
+        public string MachineId { get; set; }
+        public string EnergyModeDisplayName { get; set; }
+        public int DoseRate { get; set; }
+        public IList<MachineEnergyOption> AvailableMachineEnergies { get; set; }
+    }
+
+    internal sealed class MachineEnergyOption
+    {
+        public string MachineId { get; set; }
+        public string EnergyModeDisplayName { get; set; }
+        public int DoseRate { get; set; }
     }
 
     internal sealed class BeamAngleField
@@ -276,6 +353,7 @@ namespace VMS.TPS
             BreastLaterality laterality,
             bool includeLnImn,
             bool medial0Exists,
+            MachineEnergyOption selectedMachineEnergy,
             out BeamAngleInput input,
             out string error)
         {
@@ -311,6 +389,14 @@ namespace VMS.TPS
                 return false;
             }
 
+            if (selectedMachineEnergy == null
+                || string.IsNullOrWhiteSpace(selectedMachineEnergy.MachineId)
+                || string.IsNullOrWhiteSpace(selectedMachineEnergy.EnergyModeDisplayName))
+            {
+                error = "Machine and energy selection is required.";
+                return false;
+            }
+
             input = new BeamAngleInput
             {
                 Medial0Gantry = NormalizeAngle(medial0),
@@ -318,7 +404,10 @@ namespace VMS.TPS
                 Couch = NormalizeAngle(couch),
                 Laterality = laterality,
                 IncludeLnImn = includeLnImn,
-                Medial0AlreadyExists = medial0Exists
+                Medial0AlreadyExists = medial0Exists,
+                MachineId = selectedMachineEnergy.MachineId,
+                EnergyModeDisplayName = selectedMachineEnergy.EnergyModeDisplayName,
+                DoseRate = selectedMachineEnergy.DoseRate
             };
 
             return true;
@@ -359,9 +448,12 @@ namespace VMS.TPS
         private readonly TextBox _collimatorText;
         private readonly TextBox _couchText;
         private readonly ComboBox _lateralityCombo;
+        private readonly ComboBox _machineCombo;
+        private readonly ComboBox _energyCombo;
         private readonly CheckBox _includeLnCheck;
         private readonly CheckBox _medial0ExistsCheck;
         private readonly TextBox _previewText;
+        private readonly IList<MachineEnergyOption> _machineEnergyOptions;
 
         public BeamAngleInput SelectedInput { get; private set; }
         public IList<BeamAngleField> PreviewFields { get; private set; }
@@ -370,11 +462,14 @@ namespace VMS.TPS
         {
             Title = "BreastLRv3 - Flexible Beam Angles";
             Width = 640;
-            Height = 520;
+            Height = 600;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             ResizeMode = ResizeMode.CanMinimize;
+            _machineEnergyOptions = defaults.AvailableMachineEnergies ?? new List<MachineEnergyOption>();
 
             var root = new Grid { Margin = new Thickness(12) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -389,6 +484,22 @@ namespace VMS.TPS
             _collimatorText = AddLabeledTextBox(root, 1, "Collimator (deg, optional)", defaults.Collimator.ToString("0.##", CultureInfo.InvariantCulture));
             _couchText = AddLabeledTextBox(root, 2, "Couch (deg, optional)", defaults.Couch.ToString("0.##", CultureInfo.InvariantCulture));
 
+            var machinePanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 6) };
+            machinePanel.Children.Add(new TextBlock { Text = "Machine", Width = 200, VerticalAlignment = VerticalAlignment.Center });
+            _machineCombo = new ComboBox { Width = 240 };
+            var machineIds = _machineEnergyOptions
+                .Select(o => o.MachineId)
+                .Where(v => !string.IsNullOrWhiteSpace(v))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            for (int i = 0; i < machineIds.Count; i++)
+                _machineCombo.Items.Add(machineIds[i]);
+            _machineCombo.SelectionChanged += OnMachineSelectionChanged;
+            machinePanel.Children.Add(_machineCombo);
+            Grid.SetRow(machinePanel, 3);
+            root.Children.Add(machinePanel);
+
             var sidePanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 6) };
             sidePanel.Children.Add(new TextBlock { Text = "Laterality", Width = 200, VerticalAlignment = VerticalAlignment.Center });
             _lateralityCombo = new ComboBox { Width = 240 };
@@ -396,8 +507,15 @@ namespace VMS.TPS
             _lateralityCombo.Items.Add("Right");
             _lateralityCombo.SelectedIndex = defaults.Laterality == BreastLaterality.Left ? 0 : 1;
             sidePanel.Children.Add(_lateralityCombo);
-            Grid.SetRow(sidePanel, 3);
+            Grid.SetRow(sidePanel, 4);
             root.Children.Add(sidePanel);
+
+            var energyPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 6) };
+            energyPanel.Children.Add(new TextBlock { Text = "Energy", Width = 200, VerticalAlignment = VerticalAlignment.Center });
+            _energyCombo = new ComboBox { Width = 240 };
+            energyPanel.Children.Add(_energyCombo);
+            Grid.SetRow(energyPanel, 5);
+            root.Children.Add(energyPanel);
 
             _includeLnCheck = new CheckBox
             {
@@ -405,7 +523,7 @@ namespace VMS.TPS
                 Content = "Include LN/IMN fields (12-field template)",
                 IsChecked = defaults.IncludeLnImn
             };
-            Grid.SetRow(_includeLnCheck, 4);
+            Grid.SetRow(_includeLnCheck, 6);
             root.Children.Add(_includeLnCheck);
 
             _medial0ExistsCheck = new CheckBox
@@ -414,7 +532,7 @@ namespace VMS.TPS
                 Content = "Medial0 beam already exists (create remaining fields only)",
                 IsChecked = defaults.Medial0AlreadyExists
             };
-            Grid.SetRow(_medial0ExistsCheck, 5);
+            Grid.SetRow(_medial0ExistsCheck, 7);
             root.Children.Add(_medial0ExistsCheck);
 
             _previewText = new TextBox
@@ -427,7 +545,7 @@ namespace VMS.TPS
                 TextWrapping = TextWrapping.NoWrap,
                 MinHeight = 240
             };
-            Grid.SetRow(_previewText, 6);
+            Grid.SetRow(_previewText, 8);
             root.Children.Add(_previewText);
 
             var buttonPanel = new StackPanel
@@ -449,10 +567,89 @@ namespace VMS.TPS
             cancelButton.Click += delegate { DialogResult = false; Close(); };
             buttonPanel.Children.Add(cancelButton);
 
-            Grid.SetRow(buttonPanel, 7);
+            Grid.SetRow(buttonPanel, 9);
             root.Children.Add(buttonPanel);
 
+            if (_machineCombo.Items.Count > 0)
+            {
+                int machineIndex = 0;
+                if (!string.IsNullOrWhiteSpace(defaults.MachineId))
+                {
+                    for (int i = 0; i < _machineCombo.Items.Count; i++)
+                    {
+                        if (string.Equals(_machineCombo.Items[i].ToString(), defaults.MachineId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            machineIndex = i;
+                            break;
+                        }
+                    }
+                }
+                _machineCombo.SelectedIndex = machineIndex;
+            }
+
+            RefreshEnergyOptions(defaults);
+
             RefreshPreview();
+        }
+
+        private void OnMachineSelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            RefreshEnergyOptions(SelectedInput);
+        }
+
+        private void RefreshEnergyOptions(BeamAngleInput defaults)
+        {
+            _energyCombo.Items.Clear();
+            string selectedMachine = _machineCombo.SelectedItem as string;
+            if (string.IsNullOrWhiteSpace(selectedMachine))
+                return;
+
+            var matching = _machineEnergyOptions
+                .Where(o => string.Equals(o.MachineId, selectedMachine, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(o => o.EnergyModeDisplayName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(o => o.DoseRate)
+                .ToList();
+
+            for (int i = 0; i < matching.Count; i++)
+            {
+                var option = matching[i];
+                var item = new ComboBoxItem();
+                item.Content = string.Format(CultureInfo.InvariantCulture, "{0} ({1} MU/min)", option.EnergyModeDisplayName, option.DoseRate);
+                item.Tag = option;
+                _energyCombo.Items.Add(item);
+            }
+
+            if (_energyCombo.Items.Count == 0)
+                return;
+
+            int selectedIndex = 0;
+            if (defaults != null
+                && string.Equals(defaults.MachineId, selectedMachine, StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(defaults.EnergyModeDisplayName))
+            {
+                for (int i = 0; i < _energyCombo.Items.Count; i++)
+                {
+                    var item = _energyCombo.Items[i] as ComboBoxItem;
+                    var option = item != null ? item.Tag as MachineEnergyOption : null;
+                    if (option != null
+                        && string.Equals(option.EnergyModeDisplayName, defaults.EnergyModeDisplayName, StringComparison.OrdinalIgnoreCase)
+                        && option.DoseRate == defaults.DoseRate)
+                    {
+                        selectedIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            _energyCombo.SelectedIndex = selectedIndex;
+        }
+
+        private MachineEnergyOption GetSelectedMachineEnergy()
+        {
+            var item = _energyCombo.SelectedItem as ComboBoxItem;
+            if (item == null)
+                return null;
+            return item.Tag as MachineEnergyOption;
         }
 
         private static TextBox AddLabeledTextBox(Grid root, int row, string label, string value)
@@ -492,6 +689,7 @@ namespace VMS.TPS
                 _lateralityCombo.SelectedIndex == 0 ? BreastLaterality.Left : BreastLaterality.Right,
                 _includeLnCheck.IsChecked.HasValue && _includeLnCheck.IsChecked.Value,
                 _medial0ExistsCheck.IsChecked.HasValue && _medial0ExistsCheck.IsChecked.Value,
+                GetSelectedMachineEnergy(),
                 out input,
                 out error))
             {
@@ -505,6 +703,8 @@ namespace VMS.TPS
             sb.AppendLine(input.Laterality == BreastLaterality.Left ? "Laterality: Left" : "Laterality: Right");
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "Reference Medial0: {0:0.##}°", input.Medial0Gantry));
+            sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "Machine/Energy: {0} / {1} ({2} MU/min)", input.MachineId, input.EnergyModeDisplayName, input.DoseRate));
             sb.AppendLine();
             sb.AppendLine("Field\tOffset\tGantry\tCollimator\tCouch");
 
