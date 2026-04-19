@@ -195,7 +195,7 @@ namespace VMS.TPS
 
         private static List<MachineEnergyOption> DiscoverMachineEnergyOptions(ScriptContext context, ExternalPlanSetup plan)
         {
-            var discovered = new Dictionary<string, MachineEnergyOption>(StringComparer.OrdinalIgnoreCase);
+            var discovered = new Dictionary<Tuple<string, string, int>, MachineEnergyOption>();
 
             Action<Beam> collect = beam =>
             {
@@ -207,7 +207,7 @@ namespace VMS.TPS
                 if (string.IsNullOrWhiteSpace(machineId) || string.IsNullOrWhiteSpace(energy))
                     return;
 
-                string key = machineId + "||" + energy + "||" + beam.DoseRate.ToString(CultureInfo.InvariantCulture);
+                var key = Tuple.Create(machineId, energy, beam.DoseRate);
                 if (discovered.ContainsKey(key))
                     return;
 
@@ -454,6 +454,7 @@ namespace VMS.TPS
         private readonly CheckBox _medial0ExistsCheck;
         private readonly TextBox _previewText;
         private readonly IList<MachineEnergyOption> _machineEnergyOptions;
+        private readonly BeamAngleInput _initialInput;
 
         public BeamAngleInput SelectedInput { get; private set; }
         public IList<BeamAngleField> PreviewFields { get; private set; }
@@ -465,6 +466,7 @@ namespace VMS.TPS
             Height = 600;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             ResizeMode = ResizeMode.CanMinimize;
+            _initialInput = defaults;
             _machineEnergyOptions = defaults.AvailableMachineEnergies ?? new List<MachineEnergyOption>();
 
             var root = new Grid { Margin = new Thickness(12) };
@@ -577,7 +579,7 @@ namespace VMS.TPS
                 {
                     for (int i = 0; i < _machineCombo.Items.Count; i++)
                     {
-                        if (string.Equals(_machineCombo.Items[i].ToString(), defaults.MachineId, StringComparison.OrdinalIgnoreCase))
+                        if (string.Equals(_machineCombo.Items[i] as string, defaults.MachineId, StringComparison.OrdinalIgnoreCase))
                         {
                             machineIndex = i;
                             break;
@@ -594,10 +596,10 @@ namespace VMS.TPS
 
         private void OnMachineSelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            RefreshEnergyOptions(SelectedInput);
+            RefreshEnergyOptions(SelectedInput ?? _initialInput);
         }
 
-        private void RefreshEnergyOptions(BeamAngleInput defaults)
+        private void RefreshEnergyOptions(BeamAngleInput currentInput)
         {
             _energyCombo.Items.Clear();
             string selectedMachine = _machineCombo.SelectedItem as string;
@@ -614,7 +616,7 @@ namespace VMS.TPS
             {
                 var option = matching[i];
                 var item = new ComboBoxItem();
-                item.Content = string.Format(CultureInfo.InvariantCulture, "{0} ({1} MU/min)", option.EnergyModeDisplayName, option.DoseRate);
+                item.Content = string.Format(CultureInfo.InvariantCulture, "{0} (Dose rate {1})", option.EnergyModeDisplayName, option.DoseRate);
                 item.Tag = option;
                 _energyCombo.Items.Add(item);
             }
@@ -623,17 +625,17 @@ namespace VMS.TPS
                 return;
 
             int selectedIndex = 0;
-            if (defaults != null
-                && string.Equals(defaults.MachineId, selectedMachine, StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrWhiteSpace(defaults.EnergyModeDisplayName))
+            if (currentInput != null
+                && string.Equals(currentInput.MachineId, selectedMachine, StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(currentInput.EnergyModeDisplayName))
             {
                 for (int i = 0; i < _energyCombo.Items.Count; i++)
                 {
                     var item = _energyCombo.Items[i] as ComboBoxItem;
                     var option = item != null ? item.Tag as MachineEnergyOption : null;
                     if (option != null
-                        && string.Equals(option.EnergyModeDisplayName, defaults.EnergyModeDisplayName, StringComparison.OrdinalIgnoreCase)
-                        && option.DoseRate == defaults.DoseRate)
+                        && string.Equals(option.EnergyModeDisplayName, currentInput.EnergyModeDisplayName, StringComparison.OrdinalIgnoreCase)
+                        && option.DoseRate == currentInput.DoseRate)
                     {
                         selectedIndex = i;
                         break;
@@ -704,7 +706,7 @@ namespace VMS.TPS
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "Reference Medial0: {0:0.##}°", input.Medial0Gantry));
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "Machine/Energy: {0} / {1} ({2} MU/min)", input.MachineId, input.EnergyModeDisplayName, input.DoseRate));
+                "Machine/Energy: {0} / {1} (Dose rate {2})", input.MachineId, input.EnergyModeDisplayName, input.DoseRate));
             sb.AppendLine();
             sb.AppendLine("Field\tOffset\tGantry\tCollimator\tCouch");
 
